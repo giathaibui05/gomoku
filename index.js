@@ -78,7 +78,7 @@ app.get("/api/me", (req, res) => {
 
 var server = require("http").Server(app);
 var io = require("socket.io")(server);
-server.listen(port,'0.0.0.0', () => console.log(`🎮 Gomoku server running on http://localhost:${port}`));
+server.listen(port, () => console.log(`🎮 Gomoku server running on http://localhost:${port}`));
 
 // ========================== Classes =====================
 class User {
