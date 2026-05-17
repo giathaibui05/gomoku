@@ -101,6 +101,11 @@ class ListUsers {
     findUserID(id) { return this.users.find(u => u.id === id) || null; }
 }
 
+// ======================== Timer constants ========================
+var TIMER_TOTAL_MS = 10 * 60 * 1000; // 10 phút mỗi người
+var TIMER_LOW_MS   = 30 * 1000;      // dưới 30s = low
+var TIMER_BONUS_MS = 1000;           // +1s bonus mỗi nước khi low
+
 class Room {
     constructor(_owner, _name, _pass, _preview, _apceptViewer, _maxPlayers) {
         this.owner = _owner; this.name = _name; this.pass = _pass;
@@ -164,7 +169,71 @@ removeAllUsers() {
     addHistory(h) { this.history.push(h); }
     getHistory() { return this.history; }
     undo() { this.history.pop(); }
-    clearHistory() { this.history = []; this.gameStarted = false; }
+    clearHistory() {
+        this.history = [];
+        this.gameStarted = false;
+        this.stopTimer();
+        this.timerMs = [TIMER_TOTAL_MS, TIMER_TOTAL_MS];
+        this.currentTimerPlayer = 0;
+    }
+
+    // ---- Server-side timer ----
+    initTimer() {
+        this.timerMs = [TIMER_TOTAL_MS, TIMER_TOTAL_MS];
+        this.currentTimerPlayer = 0; // index 0 = player0 đi trước
+        this.timerLastTick = null;
+        this._timerInterval = null;
+    }
+    startTimer(io) {
+        if (this._timerInterval) clearInterval(this._timerInterval);
+        this.timerLastTick = Date.now();
+        this._timerInterval = setInterval(() => {
+            if (!this.gameStarted) { this.stopTimer(); return; }
+            var now = Date.now();
+            var elapsed = now - this.timerLastTick;
+            this.timerLastTick = now;
+            var cur = this.currentTimerPlayer;
+            this.timerMs[cur] -= elapsed;
+            if (this.timerMs[cur] <= 0) {
+                this.timerMs[cur] = 0;
+                this.stopTimer();
+                // Ai hết giờ?
+                var players = this.getPlayers();
+                if (players.length < 2) return;
+                var loser = players[cur];
+                var winner = players[1 - cur];
+                this.clearHistory();
+                io.sockets.to(this.name).emit('server_timeout_lose', {
+                    loserName: loser.name,
+                    winnerName: winner.name
+                });
+                return;
+            }
+            // Broadcast sync mỗi 2s
+            if (!this._lastSync || now - this._lastSync >= 2000) {
+                this._lastSync = now;
+                io.sockets.to(this.name).emit('server_timer_sync', {
+                    timers: this.timerMs,
+                    current: this.currentTimerPlayer
+                });
+            }
+        }, 200);
+    }
+    stopTimer() {
+        if (this._timerInterval) { clearInterval(this._timerInterval); this._timerInterval = null; }
+    }
+    switchTimerTo(playerIndex) {
+        var prev = this.currentTimerPlayer;
+        // Bonus +1s nếu người vừa đánh còn dưới 30s
+        if (this.timerMs[prev] < TIMER_LOW_MS) {
+            this.timerMs[prev] = Math.min(this.timerMs[prev] + TIMER_BONUS_MS, TIMER_LOW_MS);
+        }
+        this.currentTimerPlayer = playerIndex;
+        this.timerLastTick = Date.now();
+    }
+    getTimerState() {
+        return { timers: this.timerMs.slice(), current: this.currentTimerPlayer };
+    }
 }
 
 class ListRooms {
@@ -203,13 +272,16 @@ function startGame(room) {
     var players = room.getPlayers();
     if (players.length !== 2) return;
     room.gameStarted = true;
+    room.initTimer();
     var p0 = io.sockets.sockets.get(players[0].id);
     var p1 = io.sockets.sockets.get(players[1].id);
     if (p0) p0.emit('server_send_turn', 'on');
     if (p1) p1.emit('server_send_turn', 'off');
     io.sockets.to(room.name).emit('server_game_start', {
-        player0: players[0].name, player1: players[1].name
+        player0: players[0].name, player1: players[1].name,
+        timerState: room.getTimerState()
     });
+    room.startTimer(io);
 }
 
 // ======================== Socket.io ==========================
@@ -496,7 +568,7 @@ io.on("connection", function(soc) {
         if (!roomName) { cb(false); return; }
         var room = list_rooms.findRoom(roomName);
         if (!room) { cb(false); return; }
-        cb(room.getHistory(), room.getPlayers().map(p => p.name));
+        cb(room.getHistory(), room.getPlayers().map(p => p.name), room.getTimerState());
     });
 
     soc.on("client_clicked", function(data) {
@@ -505,6 +577,12 @@ io.on("connection", function(soc) {
         var room = list_rooms.findRoom(roomName);
         if (!room) return;
         room.addHistory(data);
+        // Switch server-side timer sang player còn lại
+        var players = room.getPlayers();
+        var myIdx = players.findIndex(p => p.id === soc.id);
+        if (myIdx >= 0) room.switchTimerTo(1 - myIdx);
+        // Broadcast ngay timer state mới
+        io.sockets.to(roomName).emit('server_timer_sync', room.getTimerState());
         soc.broadcast.to(roomName).emit('server_send_clicked', data);
         soc.broadcast.to(roomName).emit('server_send_turn', 'on');
         soc.emit('server_send_turn', 'off');

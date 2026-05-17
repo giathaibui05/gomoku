@@ -101,13 +101,19 @@ let timerState = {
     lastTick: null
 };
 
-function timerStart(myIdx, player0Name, player1Name, histories) {
+function timerStart(myIdx, player0Name, player1Name, histories, serverTimerState) {
     timerState.myIndex = myIdx;
     timerState.playerNames = [player0Name, player1Name];
     timerState.active = true;
-    timerState.timers = [TIMER_TOTAL_MS, TIMER_TOTAL_MS];
-    // Figure turn from history length
-    timerState.currentPlayer = histories.length % 2;
+    if (serverTimerState && serverTimerState.timers) {
+        // Dùng state từ server — đồng bộ chính xác kể cả sau reload
+        timerState.timers = serverTimerState.timers.slice();
+        timerState.currentPlayer = serverTimerState.current;
+    } else {
+        // Fallback: tính từ history length (chỉ dùng khi server chưa có timer)
+        timerState.timers = [TIMER_TOTAL_MS, TIMER_TOTAL_MS];
+        timerState.currentPlayer = histories.length % 2;
+    }
     timerStartTick();
     timerRender();
 }
@@ -386,14 +392,14 @@ let caro = function(p) {
             window._pendingRejoinData = null;
             _applyHistoryAndTurn(data);
         } else {
-            socket.emit('client_required_history_game', function(dataHistory, playerNames) {
+            socket.emit('client_required_history_game', function(dataHistory, playerNames, serverTimerState) {
                 if (dataHistory !== false) {
                     game.reset();
                     game.history = dataHistory || [];
                     game.drawGrid();
                     game.drawData();
                     if (playerNames && playerNames.length === 2) {
-                        _setupTimerForRoom(playerNames, game.history);
+                        _setupTimerForRoom(playerNames, game.history, serverTimerState);
                     }
                 } else {
                     Swal.fire({ icon:'error', title:'Không thể lấy dữ liệu trò chơi' });
@@ -425,13 +431,12 @@ let caro = function(p) {
         }
     }
 
-    function _setupTimerForRoom(playerNames, hist) {
-        // Determine my index
+    function _setupTimerForRoom(playerNames, hist, serverTimerState) {
         let myIdx = playerNames.indexOf(player_name);
-        if (myIdx === -1) return; // I'm a viewer
+        if (myIdx === -1) return; // viewer
         _myPlayerIndex = myIdx;
         injectTimerUI(playerNames[0], playerNames[1]);
-        timerStart(myIdx, playerNames[0], playerNames[1], hist);
+        timerStart(myIdx, playerNames[0], playerNames[1], hist, serverTimerState);
     }
 
     p.draw = function() {
@@ -452,7 +457,7 @@ let caro = function(p) {
     };
     p.windowResized = function() {
         p.resizeCanvas(p.windowWidth, p.windowHeight, true);
-        if (game) game.moveToCenterPage();
+        // KHÔNG moveToCenterPage khi resize — giữ nguyên vị trí người dùng đang xem
     };
 
     // ===================== TOUCH SUPPORT =====================
@@ -522,14 +527,13 @@ let caro = function(p) {
         // Nếu là tap ngắn (< 250ms, không drag) → đặt quân
         if (!_tapMoved && p.millis() - _tapStart < 250 && e.changedTouches.length > 0) {
             let t = e.changedTouches[0];
-            // Lưu vị trí rồi gọi clicked với tọa độ touch
-            let savedMX = p.mouseX, savedMY = p.mouseY;
-            // Ghi đè tạm bằng vị trí touch (p5 không tự làm điều này cho touchEnded)
-            p._mouseX = t.clientX;
-            p._mouseY = t.clientY;
-            if (game) game.clickedAt(t.clientX, t.clientY);
-            p._mouseX = savedMX;
-            p._mouseY = savedMY;
+            // Tính tọa độ ĐÚNG so với canvas element (không phải viewport)
+            // p5 canvas có thể không bắt đầu từ (0,0) nếu có topbar
+            let canvas = p.canvas || document.querySelector('#cnv canvas');
+            let rect = canvas ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+            let canvasX = t.clientX - rect.left;
+            let canvasY = t.clientY - rect.top;
+            if (game) game.clickedAt(canvasX, canvasY);
         }
         _pinchDist0 = null;
         return false;
@@ -586,15 +590,22 @@ let caro = function(p) {
 
     // ===================== Socket Events =====================
     function setupSocketEvent() {
+        // Sync timer từ server (mỗi 2s và sau mỗi nước đi)
+        socket.on('server_timer_sync', function(data) {
+            if (!timerState.active) return;
+            // Áp dụng state từ server — nguồn sự thật duy nhất
+            timerState.timers = data.timers.slice();
+            timerState.currentPlayer = data.current;
+            timerState.lastTick = Date.now(); // reset tick để không bị trừ 2 lần
+            timerRender();
+        });
+
         socket.on('server_send_clicked', function(data) {
             game.history.push(data);
             game.drawData();
-            game.focusToPreMove();
+            // KHÔNG auto-focus — để người chơi tự di chuyển bàn cờ
             SFX.place();
-            // Switch timer to my turn
-            if (timerState.active) {
-                timerOnMove(timerState.myIndex >= 0 ? timerState.myIndex : 0);
-            }
+            // Timer được sync qua server_timer_sync — không tự switch ở đây
         });
 
         socket.on('server_send_history', function(data) {
@@ -606,26 +617,16 @@ let caro = function(p) {
             if (data === 'off') {
                 game.turn = false;
                 if (spanTurn) spanTurn.innerHTML = 'Đối thủ: <b>' + game.getNextChar() + '</b>';
-                // Switch timer to opponent
-                if (timerState.active && _myPlayerIndex >= 0) {
-                    let oppIdx = 1 - _myPlayerIndex;
-                    timerOnMove(oppIdx);
-                }
             } else {
                 game.turn = true;
                 if (spanTurn) spanTurn.innerHTML = 'Bạn: <b>' + game.getNextChar() + '</b>';
-                // Switch timer to me
-                if (timerState.active && _myPlayerIndex >= 0) {
-                    timerOnMove(_myPlayerIndex);
-                }
             }
+            // Timer sync đến từ server_timer_sync — không tự switch ở đây
         });
 
         socket.on('server_game_start', function(data) {
-            // Game just started (2 players joined)
             let playerNames = [data.player0, data.player1];
-            _setupTimerForRoom(playerNames, game.history);
-            // Hide waiting overlay
+            _setupTimerForRoom(playerNames, game.history, data.timerState);
             let wo = document.getElementById('waitingOverlay');
             if (wo) wo.style.display = 'none';
         });
@@ -840,7 +841,9 @@ let caro = function(p) {
             this.history.push(dataClicked);
             SFX.place();
             socket.emit('client_clicked',dataClicked);
-            if(timerState.active && _myPlayerIndex>=0) timerOnMove(1-_myPlayerIndex);
+            // Timer sync từ server qua server_timer_sync
+            let isWin=this.checkWin(index.col,index.row);
+            if(isWin) { socket.emit('client_send_win',player_name); this.highlightWinLine(isWin.from,isWin.to); }
         }
         clicked() {
             if(!this.turn) return;
@@ -854,8 +857,7 @@ let caro = function(p) {
             this.history.push(dataClicked);
             SFX.place();
             socket.emit('client_clicked',dataClicked);
-            // Switch timer to opponent
-            if(timerState.active && _myPlayerIndex>=0) timerOnMove(1-_myPlayerIndex);
+            // Timer sync từ server qua server_timer_sync
             let isWin=this.checkWin(index.col,index.row);
             if(isWin) { socket.emit('client_send_win',player_name); this.highlightWinLine(isWin.from,isWin.to); }
         }
@@ -935,7 +937,13 @@ let caro = function(p) {
         }
         run() {
             this.show(); this.showMousePos(); this.hightlightPreMove(); this.controlMove();
-            if(this.focusTarget) this.pos=p5.Vector.lerp(this.pos,this.target||this.pos,.07);
+            // Auto-lerp chỉ khi focusTarget=true (người dùng bấm nút Focus thủ công)
+            // Không tự động kéo bàn cờ sau mỗi nước đi
+            if(this.focusTarget) {
+                this.pos = p5.Vector.lerp(this.pos, this.target || this.pos, 0.1);
+                // Dừng lerp khi đã gần đích
+                if(p5.Vector.dist(this.pos, this.target) < 1) this.focusTarget = false;
+            }
             this.pos.x=p.constrain(this.pos.x,-this.gra.width+this.cellSize,p.width-this.cellSize);
             this.pos.y=p.constrain(this.pos.y,-this.gra.height+this.cellSize,p.height-this.cellSize);
         }
