@@ -27,12 +27,17 @@ var UserModel = mongoose.model("User", UserSchema);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static("public"));
+app.set('trust proxy', 1);
 app.use(session({
     secret: process.env.SESSION_SECRET || "gomoku-secret-key-2024",
     resave: false,
     saveUninitialized: false,
     store: MongoStore.create({ mongoUrl: MONGO_URI }),
-    cookie: { maxAge: 7 * 24 * 60 * 60 * 1000 }
+    cookie: { 
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    secure: process.env.NODE_ENV === 'production', // ← thêm
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax' // ← thêm
+}
 }));
 
 app.post("/api/register", async (req, res) => {
