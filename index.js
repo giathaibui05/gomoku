@@ -113,6 +113,11 @@ class Room {
         this.maxPlayers = _maxPlayers || 2; this.maxUsers = 10;
         this.users = []; this.chat = []; this.history = [];
         this.gameStarted = false;
+        this.timerMs = [TIMER_TOTAL_MS, TIMER_TOTAL_MS];
+        this.currentTimerPlayer = 0;
+        this.timerLastTick = null;
+        this._timerInterval = null;
+        this._lastSync = null;
     }
     getUsersCount() { return this.users.length; }
     getPlayers() { return this.users.filter(u => !u.isViewer); }
